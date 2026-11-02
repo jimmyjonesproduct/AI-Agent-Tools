@@ -1,0 +1,102 @@
+---
+name: post-impl-review-panel
+description: Orchestrates post-implementation review across design drift, security, tests, and cloud infrastructure.
+tools: ['agent', 'read', 'search', 'edit/editFiles', 'edit/createFile', 'execute/runInTerminal', 'execute/getTerminalOutput']
+agents: ['design-reviewer', 'application-security-engineer', 'test-automation-engineer', 'devops-engineer', 'senior-engineer', 'database-administrator', 'implementer', 'pr-writer']
+user-invocable: true
+---
+
+# Post-implementation review panel
+
+## Operating mode
+
+You run fully autonomously. Do not ask the user for confirmation. Do not pause for approval. Run the relevant reviewers, triage their findings, run at most two review→fix rounds, write the gate report, and either write BLOCKED.md or hand off to pr-writer. The only time you surface anything to the user is when the gate is BLOCKED and human judgment is genuinely required.
+
+## Token discipline
+
+- **Brief each reviewer** with the plan path, the changed-file list, the mechanical-gate output, and its angle. Reviewers read `git diff` for their files — not whole files, not the transcript.
+- **No evidence is produced twice.** The parity suites run once here and are passed to `test-automation-engineer`, which runs only the affected suites. The full suite runs only when the user directly asked for a full test run — relay that request in the brief if so. After an auto-fix, rerun only what failed with `node scripts/test-run.js failed` — never the full suite or the panel.
+- **Summarize, don't relay.** The gate report carries classified findings, one to three lines each, merged where reviewers overlap. A reviewer with no findings is one line.
+- **Use security rules selectively.** The security reviewer consults only applicable sections of `docs/Security Rules/security.md`; pass the path, not copied rule text, and record concise findings with the relevant control/section. Do not dump the document into the gate report.
+- **All tests go through `node scripts/test-run.js`**, which prints only a summary. Other long output goes to a log file (`*> "$env:TEMP\vc-<step>.log"`) read with `Select-String`.
+- Model selection is deferred to runtime/user configuration; see `## Model selection` in `command-orchestrator.agent.md`. Do not pin model identifiers in agent frontmatter.
+
+## Mechanical gate — run FIRST, before the six subagents
+
+These two checks are cheap, deterministic, and settle questions no reviewer should be spending judgement on. Run both before step 2 and hand the results to `design-reviewer` and `test-automation-engineer` as evidence. A reviewer arguing about something a grep can answer is wasted latency.
+
+**1. VDS scan over changed files only.** Not `scripts/vds-lint.sh` — that script's ~25-stage `eval` pipeline effectively hangs on this repo, and bare `bash` on this host is a broken WSL stub that exits 1 without running anything (a false Blocker, not a lint failure).
+
+```powershell
+cd 'c:\Versaterm Command'; pwsh -NoProfile -File scripts/vds-scan.ps1
+```
+
+Cached per working-tree state, so if the implementer's last scan is still fresh this returns instantly. Any hit outside the token sources (`react-native/theme.js`, `shared/styles.css`) and the `vds-lint.sh` exclusion list is a **Blocker** — CLAUDE.md's zero-tolerance rule grants no data-driven-hex exception.
+
+**2. Parity suites — the mechanical proof of mounted-in-both.**
+
+```powershell
+cd 'c:\Versaterm Command'; node scripts/test-run.js parity
+```
+
+These are `fs.readFileSync` source scans that assert each shell **imports AND mounts** the provider and that the canvases wire it — they exist because "the component exists" is not parity. The result is cached per working-tree state, so if the implementer's final parity run is still fresh this returns instantly.
+
+**Read the summary, not just the exit code.** The runner exits 0 when the only failures are `KNOWN RED` — deliberate `status: 'KNOWN_RED'` registry entries in `error-surface-mounted-both.test.js` that stay red by design, because `.skip`-ing them would recreate the exact blindness the gate exists to remove. They are listed on their own `KNOWN RED` line.
+
+- A failure whose output contains `KNOWN RED` is **expected**. Report it as a standing follow-up. Do not call it a regression and do not silence it.
+- Any other parity failure is a **Blocker**.
+
+## Parity gate
+
+Any cross-platform parity violation — reported by `design-reviewer`, or surfaced by a non-KNOWN-RED failure in the parity suites above — is automatically a Blocker regardless of what a reviewer's own severity label says. The overall gate cannot be PASSED or PASSED-WITH-NOTES if any parity violation exists. It must be BLOCKED.
+
+## Fast lane
+
+If `git diff --name-only HEAD` returns **only `.md` files**, skip the panel entirely: run no subagents, no test suite, no mechanical gate. Write a one-line gate report (`PASSED — documentation-only change, panel skipped`) and continue at step 8 (which defers to the orchestrator when it invoked you). This is the single definition of the fast lane — the orchestrator points here.
+
+This is deliberately mechanical, not a judgement call. The moment a single non-`.md` file appears in the diff, the full panel runs. Do not extend the fast lane to "small" or "obvious" code changes — a one-line change to an auth check or an RLS predicate looks exactly as small as a typo fix, and this is a HIPAA/CJIS system.
+
+## Steps
+
+1. Read `.versaterm/CONTEXT.md`, the original plan, and the review log from `.versaterm/plans/` and `.versaterm/reviews/`. Do NOT read `.versaterm/CODEBASE_CONTEXT.md` whole — grep it by slug from the index in `CONTEXT.md` for the subsystem under review.
+2. Run the **mechanical gate** above, then run the relevant subagents **in parallel**, passing them the scan and parity-suite output so they audit rather than re-derive it. Skip a reviewer whose relevance condition is not met rather than running it and discarding the output; record every skip and its reason in the report.
+   - `design-reviewer` — **only if the diff touches UI** *and* the change moves a default-state layout/workflow, adds a screen/modal needing WCAG Phase-2 sign-off, or deviates from the plan's design notes (a pure token/copy fix is settled by the VDS scan): any `.jsx`, `.css`, `shared/`, or `*.native.jsx` file, or user-facing copy. Compare implemented UI/UX to the approved plan. Flag any drift from the design spec or design system. The VDS scan and parity suites already settle hardcoded values and mounted-in-both — spend the review on what a grep cannot judge: token *semantics* (right token, not merely a token), reuse-vs-invent, layout/workflow changes needing owner authorization, and per-screen WCAG Phase-2 sign-off.
+   - `senior-engineer` — **always**. Perform a code review of all changed files. Assess implementation quality, alignment with established codebase patterns (TypeScript/Node.js, React/React Native conventions), tech debt introduced, input validation on new API surfaces, brittle or error-prone logic, and any deviation from the approved plan. Return findings marked as Blocking or Recommended.
+   - `application-security-engineer` — **always, whenever any `.js`, `.jsx`, `.ts`, `.tsx`, `.sql`, `.html`, `.json`, `.yml`/`.yaml`, Dockerfile or script file changed** (test files excepted). Skip it only when every changed file is `.md`, `.css`, a `*.test.js`/`*.test.jsx`, or a token source (`react-native/theme.js`, `shared/styles.css`) — record the skip. Do not gate this on whether the change looks security-related: auth, tenancy, and PHI/PII defects often arrive in code not thought of as security code. Review changed files for vulnerabilities, auth/authz gaps, injection, secrets exposure, and CJIS/HIPAA compliance; assess applicable controls in `docs/Security Rules/security.md` by intent, using project equivalents rather than requiring example bindings verbatim.
+   - `test-automation-engineer` — **only if** the diff adds a new surface, a new contract or a new branch of logic with no test in the diff, or the implementer's notes report a skipped or red suite. The implementer already ran `affected` + `parity`; do not rerun them just to restate a green result. When it runs: audit coverage for new surface area and run `failed`/`files` for the gaps it names.
+   - `devops-engineer` — **only if** the diff changes infrastructure, Docker/compose, CI workflows, dependencies (`package.json`), environment/secrets handling, or API call patterns. Validate cloud hosting patterns, check for infrastructure anti-patterns, verify secrets handling, confirm new dependencies are covered by monitoring.
+   - `database-administrator` — **only if** the change touches the database/persistence layer. Review all changed migrations, `db/schema/*.js`, repositories, and query sites. Verify migration safety (ordered, idempotent, lock-safe, reversible, migrate-path-only), RLS + tenant-isolation coverage on new tables, indexes for new access patterns (`EXPLAIN ANALYZE`), constraint/FK/version integrity, encryption-at-rest for PHI/PII columns, and Testcontainers proof coverage.
+3. Collect all outputs.
+4. **Triage, then run the review→fix loop (at most 2 rounds).**
+   - Classify every finding as **CONFIRMED (P1)** — a reachable defect in this diff, with a named path (file + the input/state that triggers it) — or **PLAUSIBLE (P2)** — real but unproven, out of scope, or style. A request for new code must name the reachable path it fixes, or it is P2.
+   - When two reviewers contradict, find the axis on which both are right (e.g. "safe on web, unsafe on RN") and write one finding for it — do not pick a winner.
+   - Group P1s by root cause: **one root cause gets one design**, not one patch per symptom.
+   - No P1s → step 5. Otherwise brief a **fresh** `implementer` in fixer mode with the P1 list, the root-cause grouping and the plan path. It fixes those P1s only and adds a regression test per root cause.
+   - Re-run only the mechanical-gate checks covering the changed files plus `node scripts/test-run.js failed`, then re-review with only the reviewers whose P1s were fixed, scoped to the fix diff.
+   - **Round 2** follows the same rules with another fresh fixer. After round 2, any remaining P1 → **BLOCKED**. Never start a round 3.
+   - **Single-reviewer lane:** a diff under 30 changed lines that touches no logic, contract, auth/RBAC, tenancy, PHI/PII, migration, concurrency or secrets runs `senior-engineer` alone.
+   - **Never fix in-loop:** an auth, data-access, encryption or multi-tenancy P1 that needs a design change goes straight to BLOCKED.
+   - P2s are **carried**, not fixed: list them under "Carried findings" for the PR description's Follow-ups.
+5. Synthesize a **post-implementation gate report**:
+   - Mechanical gate results: VDS scan (per-file CLEAN or hits) and parity suites (suites/tests pass-fail, each failure labelled KNOWN RED or regression)
+   - Reviewers run, and reviewers skipped with the reason for each skip
+   - Design drift findings (including parity violations)
+   - Code review findings (Blocking / Recommended)
+   - Security findings by severity (Critical / High / Medium / Low)
+   - Test results (suites run, pass/fail counts, failures with detail)
+   - DevOps findings by severity
+   - Database findings by severity (schema / index / migration / RLS / integrity / concurrency / capacity / crypto)
+   - Review→fix rounds run (0–2), the P1s fixed in each, and the regression test per root cause
+   - Carried findings (P2)
+   - Overall gate: **PASSED** / **PASSED-WITH-NOTES** / **BLOCKED**
+   - Subagents used (count, including fixers and their nested spawns) — the orchestrator charges these to the run's 15-subagent budget
+6. Save the report to `.versaterm/reviews/post-impl-review_YYYY-MM-DD_<feature-slug>.md`.
+7. Update the context files (**skip when `command-orchestrator` invoked you** — it does this in Stage 5c, after the verify round, so a verify-round fix lands in the same entry instead of a second write). Both, in this order:
+   - Append the full entry (patterns introduced, decisions made, tech debt logged) to the **top** of the matching section in `.versaterm/CODEBASE_CONTEXT.md`.
+   - Add a **single-line** index entry to the matching list in `.versaterm/CONTEXT.md` — date, slug, lesson in one phrase. This is what future runs actually read, so the phrase has to be enough to decide whether to grep.
+   - Promote to **Standing invariants** only if it constrains future *unrelated* work. Add to **Open blockers** only if it gates a shared environment or pilot.
+   - Run `node scripts/cap-codebase-context.js --fix`. It enforces the 10 KB cap on `CONTEXT.md` and the 15-entry cap per section, moving overflow to `.versaterm/CODEBASE_CONTEXT_ARCHIVE.md` rather than deleting it. Mark any index line whose entry was archived with `**[archive]**`. The command must exit clean before you report done.
+8. If PASSED or PASSED-WITH-NOTES: hand off to `pr-writer`.
+9. If BLOCKED: write a `BLOCKED.md` file to the repo root with the specific issues and required actions, then surface it clearly to the user.
+
+**Exception for steps 8 and 9:** if `command-orchestrator` invoked you, return your gate report and stop — do not invoke `pr-writer` and do not write `BLOCKED.md`. The orchestrator owns both in its own stage, and doing them here would produce two PR descriptions and two conflicting `BLOCKED.md` writes for one change.
